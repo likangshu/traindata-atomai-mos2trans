@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MoS2 晶界交互编辑器 V33 - 训练集制造版 (修复 TIFF & CIF 支持)</title>
+    <!-- 引入核心库 -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- 引入 TIFF 解码库 -->
+    <script src="https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; background-color: #020617; color: #f1f5f9; font-family: system-ui, -apple-system, sans-serif; height: 100vh; overflow: hidden; }
+        canvas { image-rendering: pixelated; display: block; background-color: #000; transition: cursor 0.2s; }
+        
+        .main-viewport { 
+            flex: 1; 
+            background-color: #000; 
+            overflow: auto; 
+            position: relative;
+            display: block;
+        }
+
+        .main-viewport::-webkit-scrollbar { width: 14px; height: 14px; }
+        .main-viewport::-webkit-scrollbar-track { background: #0f172a; }
+        .main-viewport::-webkit-scrollbar-thumb { background: #3b82f6; border-radius: 7px; border: 3px solid #0f172a; }
+        .main-viewport::-webkit-scrollbar-thumb:hover { background: #60a5fa; }
+
+        .canvas-wrapper { 
+            display: inline-flex; 
+            align-items: center; 
+            justify-content: center; 
+            min-width: 100%;
+            padding: 400px;
+        }
+        
+        .sidebar-scroll { -ms-overflow-style: none; scrollbar-width: none; }
+        .sidebar-scroll::-webkit-scrollbar { display: none; }
+        
+        .tool-active { border-color: #3b82f6 !important; background-color: rgba(59, 130, 246, 0.2) !important; color: #60a5fa !important; }
+        input[type="range"] { accent-color: #3b82f6; width: 100%; height: 4px; background: #1e293b; border-radius: 2px; appearance: none; cursor: pointer; }
+        input[type="range"]::-webkit-slider-thumb { appearance: none; width: 12px; height: 12px; background: #3b82f6; border-radius: 50%; }
+        
+        .zoom-overlay { position: absolute; bottom: 40px; right: 40px; z-index: 50; pointer-events: none; }
+        .interaction-hint { position: absolute; top: 120px; right: 20px; z-index: 40; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- 物理核心算法：点在多边形内判定 ---
+        const isPointInPolygon = (x, y, polygon) => {
+            if (!polygon || polygon.length < 3) return false;
+            let inside = false;
+            for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                const xi = polygon[i].x, yi = polygon[i].y, xj = polygon[j].x, yj = polygon[j].y;
+                if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+            }
+            return inside;
+        };
+
+        const Icon = ({ name, size = 18, className = "" }) => {
+            const containerRef = React.useRef(null);
+            React.useEffect(() => {
+                if (window.lucide && containerRef.current) {
+                    containerRef.current.innerHTML = '';
+                    const iconElt = document.createElement('i');
+                    iconElt.setAttribute('data-lucide', name);
+                    if (className) iconElt.className = className;
+                    containerRef.current.appendChild(iconElt);
+                    window.lucide.createIcons({ attrs: { strokeWidth: 2, width: size, height: size } });
+                }
+            }, [name, size, className]);
+            return <span ref={containerRef} className="inline-flex items-center justify-center leading-none" />;
+        };
+
+        const SCALE_DEFAULT = 0.10079; // A/Pixel
+        const ATOM_COLORS = { 
+            Mo: '#fbbf24', S2: '#60a5fa', S1: '#f87171', 
+            GBMask: 'rgba(239, 68, 68, 0.3)', DomainBoundary: 'rgba(59, 130, 246, 0.2)', Ghost: 'rgba(255, 255, 255, 0.5)' 
+        };
+
+        const App = () => {
+            const [image, setImage] = React.useState(null);
+            const [zoomLevel, setZoomLevel] = React.useState(1.0);
+            const [manualAtoms, setManualAtoms] = React.useState(() => JSON.parse(localStorage.getItem('mos2_manual_v32')) || []);
+            const [gbMasks, setGbMasks] = React.useState(() => JSON.parse(localStorage.getItem('mos2_masks_v32')) || []);
+            const [domains, setDomains] = React.useState(() => JSON.parse(localStorage.getItem('mos2_domains_v32')) || []);
+            const [currentSeeds, setCurrentSeeds] = React.useState(() => JSON.parse(localStorage.getItem('mos2_seeds_v32')) || []);
+            const [viewMode, setViewMode] = React.useState('edit');
+            const [selectedType, setSelectedType] = React.useState('Mo');
+            const [currentPolygon, setCurrentPolygon] = React.useState(null);
+            const [ghostDomain, setGhostDomain] = React.useState(null);
+            const [editingDomain, setEditingDomain] = React.useState(null);
+            const [history, setHistory] = React.useState([]);
+            const [message, setMessage] = React.useState(null);
+            const [isDragging, setIsDragging] = React.useState(false);
+            const [dragStart, setDragStart] = React.useState(null);
+            const [selectionStart, setSelectionStart] = React.useState(null);
+            const [selectionEnd, setSelectionEnd] = React.useState(null);
+            const canvasRef = React.useRef(null);
+
+            const showMsg = (txt) => { setMessage(txt); setTimeout(() => setMessage(null), 3000); };
+
+            // --- 核心工具：坐标换算 ---
+            const getRealCoords = (e) => {
+                if (!canvasRef.current) return { x: 0, y: 0 };
+                const rect = canvasRef.current.getBoundingClientRect();
+                return { 
+                    x: (e.clientX - rect.left) / zoomLevel, 
+                    y: (e.clientY - rect.top) / zoomLevel 
+                };
+            };
+
+            const adjustTransform = (target, key, deltaOrValue, isAbsolute = false) => {
+                const setter = target === 'ghost' ? setGhostDomain : setEditingDomain;
+                setter(prev => {
+                    if (!prev) return null;
+                    const newVal = isAbsolute ? deltaOrValue : prev.transform[key] + deltaOrValue;
+                    return { ...prev, transform: { ...prev.transform, [key]: newVal } };
+                });
+            };
+
+            const handleWheel = (e) => {
+                if (e.ctrlKey || e.metaKey) {
+                    e.preventDefault();
+                    setZoomLevel(prev => Math.min(Math.max(prev * (e.deltaY > 0 ? 0.9 : 1.1), 0.1), 10));
+                }
+            };
+
+            const restoreProgress = () => {
+                const sM = localStorage.getItem('mos2_manual_v32');
+                if (sM) {
+                    setManualAtoms(JSON.parse(sM) || []);
+                    setGbMasks(JSON.parse(localStorage.getItem('mos2_masks_v32')) || []);
+                    setDomains(JSON.parse(localStorage.getItem('mos2_domains_v32')) || []);
+                    setCurrentSeeds(JSON.parse(localStorage.getItem('mos2_seeds_v32')) || []);
+                    showMsg("历史数据已恢复");
+                }
+            };
+
+            // --- 核心修复：TIFF 导入 (针对高位深乱码修复) ---
+            const handleImageUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const isTiff = file.name.toLowerCase().endsWith('.tif') || file.name.toLowerCase().endsWith('.tiff');
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    if (isTiff) {
+                        try {
+                            const ifds = UTIF.decode(event.target.result);
+                            const ifd = ifds[0]; // 只处理第一帧
+                            UTIF.decodeImage(event.target.result, ifd);
+                            
+                            const width = ifd.width;
+                            const height = ifd.height;
+                            
+                            // 重新解释原始字节数据，适配 DM 导出的 16-bit 或 32-bit TIFF
+                            const bps = ifd.t258 ? ifd.t258[0] : 8;
+                            const sampleFmt = ifd.t339 ? ifd.t339[0] : 1;
+                            const raw = ifd.data;
+                            const nPix = width * height;
+                            let pixels;
+
+                            if (bps === 32 && sampleFmt === 3) {
+                                pixels = new Float32Array(raw.buffer, raw.byteOffset, nPix);
+                            } else if (bps === 32 && sampleFmt === 1) {
+                                pixels = new Uint32Array(raw.buffer, raw.byteOffset, nPix);
+                            } else if (bps === 16 && sampleFmt === 1) {
+                                pixels = new Uint16Array(raw.buffer, raw.byteOffset, nPix);
+                            } else if (bps === 16 && sampleFmt === 2) {
+                                pixels = new Int16Array(raw.buffer, raw.byteOffset, nPix);
+                            } else {
+                                pixels = raw;
+                            }
+
+                            // 计算物理范围用于拉伸对比度
+                            let min = Infinity, max = -Infinity;
+                            for (let i = 0; i < nPix; i++) {
+                                const v = pixels[i];
+                                if (v < min) min = v;
+                                if (v > max) max = v;
+                            }
+                            const range = max - min || 1;
+
+                            // 构建 RGBA 可视化数据
+                            const rgba = new Uint8ClampedArray(nPix * 4);
+                            for (let i = 0; i < nPix; i++) {
+                                const val = ((pixels[i] - min) / range) * 255;
+                                const idx = i * 4;
+                                rgba[idx] = val;     // R
+                                rgba[idx+1] = val;   // G
+                                rgba[idx+2] = val;   // B
+                                rgba[idx+3] = 255;   // A
+                            }
+
+                            const canvas = document.createElement('canvas');
+                            canvas.width = width; canvas.height = height;
+                            const ctx = canvas.getContext('2d');
+                            ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+
+                            const img = new Image();
+                            img.onload = () => { setImage(img); setZoomLevel(1.0); showMsg("TIFF 高位深重构成功"); };
+                            img.src = canvas.toDataURL();
+                        } catch (err) {
+                            console.error(err); showMsg("TIFF 解码失败");
+                        }
+                    } else {
+                        const img = new Image();
+                        img.onload = () => { setImage(img); setZoomLevel(1.0); };
+                        img.src = event.target.result;
+                    }
+                };
+                if (isTiff) reader.readAsArrayBuffer(file);
+                else reader.readAsDataURL(file);
+            };
+
+            // --- 核心修复：载入 CIF 并同步到标注系统 ---
+            const handleCifImport = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const lines = event.target.result.split('\n');
+                    let cell = { a: 1, b: 1 }, rawAtoms = [], loopCols = [], inLoop = false;
+                    lines.forEach(line => {
+                        const l = line.trim();
+                        if (l.includes('_cell_length_a')) cell.a = parseFloat(l.split(/\s+/).pop());
+                        if (l.includes('_cell_length_b')) cell.b = parseFloat(l.split(/\s+/).pop());
+                        if (l === 'loop_') { inLoop = true; loopCols = []; return; }
+                        if (inLoop && l.startsWith('_atom_site_')) { loopCols.push(l); return; }
+                        if (inLoop && l && !l.startsWith('_')) {
+                            const parts = l.split(/\s+/);
+                            const getIdx = (k) => loopCols.findIndex(c => c.includes(k));
+                            const xIdx = getIdx('_fract_x'), yIdx = getIdx('_fract_y'), symIdx = getIdx('_type_symbol');
+                            if (xIdx !== -1) {
+                                rawAtoms.push({ fx: parseFloat(parts[xIdx]), fy: parseFloat(parts[yIdx]), sym: parts[symIdx] || 'S' });
+                            }
+                        }
+                    });
+
+                    // 将分数坐标转换为像素坐标
+                    const imported = rawAtoms.map(a => {
+                        const isMo = a.sym.toUpperCase().startsWith('M');
+                        return {
+                            x: (a.fx * cell.a) / SCALE_DEFAULT,
+                            y: (a.fy * cell.b) / SCALE_DEFAULT,
+                            type: isMo ? 'Mo' : 'S2',
+                            id: `cif-${Date.now()}-${Math.random()}`
+                        };
+                    });
+
+                    if (imported.length > 0) {
+                        pushHistory();
+                        setManualAtoms(prev => [...prev, ...imported]);
+                        showMsg(`已导入 CIF 结构：包含 ${imported.length} 个原子点位`);
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            // --- 核心功能：裁剪导出训练集 (CSV + PNG) ---
+            const exportCroppedPatch = () => {    
+                if (!image) { showMsg("请先载入图像"); return; }    
+                const all = [...manualAtoms, ...domains.flatMap(d => d.atoms)];    
+                if (all.length === 0) { showMsg("未检测到标注点，无法导出"); return; }
+                const frameNum = prompt("当前帧编号 (用于输出文件名):", "001") || "001";    
+                showMsg("请在画布上拖拽框选训练区域（绿色框）");    
+                setViewMode('crop_export');    
+                window._cropFrameNum = frameNum;
+            };
+
+            const finalizeCropExport = (x1, y1, x2, y2) => {    
+                const left = Math.min(x1, x2), top = Math.min(y1, y2);    
+                const right = Math.max(x1, x2), bottom = Math.max(y1, y2);    
+                const w = right - left, h = bottom - top;    
+                if (w < 50 || h < 50) { showMsg("选区过小，已取消"); setViewMode('edit'); return; }    
+                
+                const frameNum = window._cropFrameNum || "001";    
+                const labelMap = { Mo: 0, S2: 1, S1: 2, Contam: 3 };    
+                const all = [...manualAtoms, ...domains.flatMap(d => d.atoms)];    
+                // 筛选出落在框内的原子
+                const inside = all.filter(a => a.x >= left && a.x <= right && a.y >= top && a.y <= bottom);    
+                
+                // 1. 导出局部 CSV (坐标已根据裁剪框原点偏移)
+                let csv = "frame,x,y,label\n";    
+                inside.forEach(a => {        
+                    csv += `${frameNum},${(a.x - left).toFixed(2)},${(a.y - top).toFixed(2)},${labelMap[a.type] ?? 3}\n`;    
+                });    
+                const csvBlob = new Blob([csv], { type: 'text/csv' });    
+                const csvLink = document.createElement('a');    
+                csvLink.href = URL.createObjectURL(csvBlob);    
+                csvLink.download = `anchors_frame_${frameNum}.csv`;    
+                csvLink.click();    
+                
+                // 2. 导出裁剪图像
+                const tmpCanvas = document.createElement('canvas');    
+                tmpCanvas.width = Math.round(w); tmpCanvas.height = Math.round(h);    
+                const tmpCtx = tmpCanvas.getContext('2d');    
+                tmpCtx.drawImage(image, left, top, w, h, 0, 0, Math.round(w), Math.round(h));    
+                tmpCanvas.toBlob(blob => {        
+                    const imgLink = document.createElement('a');        
+                    imgLink.href = URL.createObjectURL(blob);        
+                    imgLink.download = `patch_frame_${frameNum}.png`;        
+                    imgLink.click();        
+                    showMsg(`导出成功！已保存 ${inside.length} 个点 + 裁剪图`);    
+                }, 'image/png');    
+                setViewMode('edit');
+            };
+
+            const undo = () => {
+                if (history.length === 0) return;
+                const last = JSON.parse(history[0]);
+                setManualAtoms(last.manualAtoms); setGbMasks(last.gbMasks); setDomains(last.domains); setCurrentSeeds(last.currentSeeds);
+                setHistory(prev => prev.slice(1));
+            };
+
+            const pushHistory = React.useCallback(() => {
+                setHistory(prev => [JSON.stringify({ manualAtoms, gbMasks, domains, currentSeeds }), ...prev].slice(0, 30));
+            }, [manualAtoms, gbMasks, domains, currentSeeds]);
+
+            const handleMouseDown = (e) => {
+                const { x, y } = getRealCoords(e);
+                if (viewMode === 'delete_area' || viewMode === 'crop_export') { setIsDragging(true); setSelectionStart({ x, y }); setSelectionEnd({ x, y }); }
+            };
+
+            const handleMouseMove = (e) => {
+                const { x, y } = getRealCoords(e);
+                if (isDragging) {
+                    if (viewMode === 'delete_area' || viewMode === 'crop_export') setSelectionEnd({ x, y });
+                }
+            };
+
+            const handleMouseUp = () => {
+                if (isDragging && viewMode === 'crop_export' && selectionStart && selectionEnd) { 
+                    finalizeCropExport(selectionStart.x, selectionStart.y, selectionEnd.x, selectionEnd.y); 
+                    setSelectionStart(null); setSelectionEnd(null); setIsDragging(false); return; 
+                }
+                if (isDragging && viewMode === 'delete_area' && selectionStart && selectionEnd) {
+                    pushHistory(); 
+                    const x1 = Math.min(selectionStart.x, selectionEnd.x), y1 = Math.min(selectionStart.y, selectionEnd.y), x2 = Math.max(selectionStart.x, selectionEnd.x), y2 = Math.max(selectionStart.y, selectionEnd.y);
+                    const inB = (p) => p.x >= x1 && p.x <= x2 && p.y >= y1 && p.y <= y2;
+                    setManualAtoms(p => p.filter(a => !inB(a))); setDomains(p => p.map(d => ({ ...d, atoms: d.atoms.filter(a => !inB(a)) })));
+                    setSelectionStart(null); setSelectionEnd(null);
+                }
+                setIsDragging(false);
+            };
+
+            const handleCanvasClick = (e) => {
+                if (isDragging || viewMode === 'crop_export') return;
+                const { x, y } = getRealCoords(e);
+                if (viewMode === 'edit') { pushHistory(); setManualAtoms([...manualAtoms, { x, y, type: selectedType, id: Date.now() }]); }
+            };
+
+            // --- 渲染引擎 ---
+            React.useEffect(() => {
+                if (!image || !canvasRef.current) return;
+                const ctx = canvasRef.current.getContext('2d'); ctx.clearRect(0, 0, image.width, image.height); ctx.drawImage(image, 0, 0);
+                
+                // 绘制打点
+                manualAtoms.forEach(a => { ctx.beginPath(); ctx.arc(a.x, a.y, 6, 0, Math.PI*2); ctx.fillStyle = ATOM_COLORS[a.type]; ctx.fill(); ctx.strokeStyle="#fff"; ctx.lineWidth=1.5; ctx.stroke(); });
+                // 绘制分域点
+                domains.forEach(d => d.atoms.forEach(a => { ctx.beginPath(); ctx.arc(a.x, a.y, 4, 0, Math.PI*2); ctx.fillStyle = ATOM_COLORS[a.type]+'88'; ctx.fill(); }));
+
+                // 绘制拖拽选择框
+                if (isDragging && selectionStart && selectionEnd) {
+                    ctx.strokeStyle = viewMode === 'crop_export' ? '#22c55e' : '#ef4444';
+                    ctx.fillStyle = viewMode === 'crop_export' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)';
+                    ctx.setLineDash([5, 5]);
+                    ctx.strokeRect(selectionStart.x, selectionStart.y, selectionEnd.x - selectionStart.x, selectionEnd.y - selectionStart.y);
+                    ctx.fillRect(selectionStart.x, selectionStart.y, selectionEnd.x - selectionStart.x, selectionEnd.y - selectionStart.y);
+                    ctx.setLineDash([]);
+                }
+            }, [image, manualAtoms, domains, selectionStart, selectionEnd, isDragging, viewMode, zoomLevel]);
+
+            return (
+                <div className="flex flex-col h-screen bg-[#020617] text-slate-100 overflow-hidden font-sans">
+                    <div className="flex items-center justify-between px-6 py-3 bg-[#0f172a] border-b border-slate-800 z-30 shadow-xl">
+                        <div className="flex items-center gap-6">
+                            <h1 className="text-xl font-black text-blue-400 italic flex items-center gap-2 tracking-tighter"><Icon name="layers" size={22} className="text-blue-500" /> MoS2 PRECISION V33</h1>
+                            <div className="flex gap-2">
+                                <button onClick={undo} className="p-2 bg-slate-800 hover:bg-slate-700 rounded transition border border-slate-700"><Icon name="undo-2" size={16}/></button>
+                                <button onClick={restoreProgress} className="bg-blue-900/30 hover:bg-blue-800 rounded px-3 text-xs font-bold border border-blue-800 text-blue-300">恢复历史</button>
+                            </div>
+                        </div>
+                        <div className="flex gap-2 items-center">
+                            <label className="bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded-lg cursor-pointer text-xs font-bold border border-slate-700 flex items-center gap-2">
+                                <Icon name="image" size={14}/> 载入 STEM (修复乱码)<input type="file" className="hidden" onChange={handleImageUpload} />
+                            </label>
+                            <label className="bg-indigo-900/40 hover:bg-indigo-800 px-4 py-2 rounded-lg cursor-pointer text-xs font-bold border border-indigo-700 text-indigo-300 flex items-center gap-2">
+                                <Icon name="file-digit" size={14}/> 载入 CIF 标注<input type="file" className="hidden" accept=".cif" onChange={handleCifImport} />
+                            </label>
+                            <button onClick={exportCroppedPatch} className="bg-emerald-600 hover:bg-emerald-500 px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg transition"><Icon name="crop" size={14}/> 裁剪导出训练集</button>
+                        </div>
+                    </div>
+
+                    <div className="flex flex-1 overflow-hidden relative">
+                        {message && <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-blue-600 px-6 py-2 rounded-full font-bold text-sm animate-bounce shadow-2xl">{message}</div>}
+
+                        <div className="w-64 bg-[#0f172a] border-r border-slate-800 p-5 flex flex-col gap-6 overflow-y-auto sidebar-scroll">
+                            <section>
+                                <h2 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4 text-center border-b border-slate-800 pb-2">标注工具</h2>
+                                <div className="grid grid-cols-2 gap-2 mb-2">
+                                    <button onClick={() => setViewMode('edit')} className={`p-3 rounded-xl border-2 transition ${viewMode === 'edit' ? 'tool-active' : 'border-slate-800'}`}><Icon name="plus" size={18} /><span className="text-[9px] block mt-1">手动打点</span></button>
+                                    <button onClick={() => setViewMode('delete_area')} className={`p-3 rounded-xl border-2 transition ${viewMode === 'delete_area' ? 'tool-active' : 'border-slate-800'}`}><Icon name="square" size={18} /><span className="text-[9px] block mt-1">区域清除</span></button>
+                                </div>
+                                <div className="flex gap-1 bg-black/40 p-1 rounded-lg">
+                                    {['Mo', 'S2', 'S1'].map(t => ( <button key={t} onClick={() => setSelectedType(t)} className={`flex-1 py-1 rounded text-[10px] font-bold ${selectedType === t ? 'bg-blue-600 text-white' : 'text-slate-500'}`}>{t}</button> ))}
+                                </div>
+                            </section>
+                            
+                            <div className="mt-auto p-4 bg-slate-900/50 rounded-2xl border border-slate-800">
+                                <h3 className="text-[9px] font-bold text-slate-500 mb-2 uppercase tracking-tighter">当前总标注</h3>
+                                <p className="text-xl font-black text-blue-400">{manualAtoms.length + domains.reduce((a,b)=>a+b.atoms.length,0)} <span className="text-[10px] text-slate-500 font-normal">原子</span></p>
+                            </div>
+                        </div>
+
+                        <div className="main-viewport" onWheel={handleWheel}>
+                            {viewMode === 'crop_export' && (
+                                <div className="interaction-hint bg-emerald-900/60 backdrop-blur-md px-6 py-2 rounded-full border border-emerald-400/50 flex items-center gap-3">
+                                    <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                                    <span className="text-xs font-black uppercase text-emerald-200">请框选包含缺陷的训练区域 (绿色框)</span>
+                                </div>
+                            )}
+
+                            <div className="canvas-wrapper">
+                                {image ? (
+                                    <div className="relative shadow-2xl border border-slate-800 bg-slate-950">
+                                        <canvas 
+                                            ref={canvasRef} 
+                                            width={image.width} height={image.height} 
+                                            onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onClick={handleCanvasClick} 
+                                            style={{ 
+                                                width: (image.width * zoomLevel) + 'px', 
+                                                height: (image.height * zoomLevel) + 'px',
+                                                cursor: viewMode === 'crop_export' ? 'crosshair' : 'default'
+                                            }}
+                                        />
+                                    </div>
+                                ) : (
+                                    <div className="opacity-20 font-black text-center uppercase tracking-widest flex flex-col items-center">
+                                        <Icon name="refresh-cw" size={80} className="animate-spin mb-4" />
+                                        <p className="text-sm">等待 STEM 图像源</p>
+                                    </div>
+                                )}
+                            </div>
+                            
+                            <div className="zoom-overlay">
+                                <div className="bg-slate-900/90 border border-slate-700 px-4 py-2 rounded-full text-[10px] font-mono text-blue-400 backdrop-blur-sm shadow-xl flex items-center gap-4">
+                                    <span>{(zoomLevel * 100).toFixed(0)}%</span>
+                                    <button onClick={() => setZoomLevel(1.0)} className="hover:text-white transition-colors border-l border-slate-700 pl-3">RESET</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
